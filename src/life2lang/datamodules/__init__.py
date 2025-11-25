@@ -1,0 +1,2 @@
+from life2lang.datamodules.unsupervised_datamodule import ProteinSequenceDataModule
+ 
