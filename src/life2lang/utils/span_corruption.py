@@ -12,7 +12,7 @@ def protein_span_corruption(
     mean_span_length: average number of tokens per masked span
     noise_density: fraction of tokens to mask
     """
-    
+
     if isinstance(sequences, str):
         tokens = list(sequences)
         return _corrupt_sequence(tokens=tokens, mean_span_length=mean_span_length, noise_density=noise_density)
