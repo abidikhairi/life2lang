@@ -18,6 +18,7 @@ __pycache__/*
 .DS_Store
 test_*.ipynb
 data/
+!notebook/data/
 
 # Project files
 .ropeproject
