@@ -1486,8 +1486,72 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
         self.model_parallel = False
         self.device_map = None
 
+    def get_position_embeddings(self) -> int:
+        return self.config.relative_attention_max_distance
+
     def resize_position_embeddings(self, new_num_position_embeddings: int):
-        pass
+        """
+        Extend the model's context length by increasing relative_attention_max_distance.
+
+        T5 encodes position through log-linear bucketed relative bias rather than
+        absolute embeddings.  The bias table has shape (num_buckets, num_heads) and
+        is shared across all layers via the first layer of each stack.  Positions
+        beyond max_distance all map to the same outermost bucket, so any sequence
+        longer than max_distance loses position discrimination.
+
+        This method:
+          1. Grows num_buckets proportionally so bucket density stays constant.
+          2. Expands the relative_attention_bias embedding, initialising new rows
+             near zero so the extended buckets start as neutral.
+          3. Updates max_distance and num_buckets on the config and every
+             T5Attention module so compute_bias uses the new range immediately.
+
+        Args:
+            new_num_position_embeddings: New maximum relative distance (context
+                length). Must be strictly greater than the current value.
+        """
+        old_max_distance = self.config.relative_attention_max_distance
+        if new_num_position_embeddings <= old_max_distance:
+            raise ValueError(
+                f"new_num_position_embeddings ({new_num_position_embeddings}) must be "
+                f"greater than the current relative_attention_max_distance ({old_max_distance})."
+            )
+
+        old_num_buckets = self.config.relative_attention_num_buckets
+        # Scale num_buckets proportionally so log-bucket density is preserved.
+        scale = new_num_position_embeddings / old_max_distance
+        new_num_buckets = round(old_num_buckets * scale)
+        # Keep even so the encoder/decoder bucket split stays symmetric.
+        if new_num_buckets % 2 != 0:
+            new_num_buckets += 1
+
+        # Resize every relative_attention_bias embedding (one per stack — only
+        # the first T5Attention in each stack owns one).
+        for module in self.modules():
+            if isinstance(module, T5Attention) and module.has_relative_attention_bias:
+                old_embed = module.relative_attention_bias
+                new_embed = nn.Embedding(new_num_buckets, module.n_heads)
+                # Copy trained rows; new rows stay near zero (default init).
+                with torch.no_grad():
+                    rows_to_copy = min(old_num_buckets, new_num_buckets)
+                    new_embed.weight[:rows_to_copy] = old_embed.weight[:rows_to_copy]
+                    init.normal_(new_embed.weight[rows_to_copy:], mean=0.0, std=0.02)
+                new_embed.weight._is_hf_initialized = True
+                module.relative_attention_bias = new_embed
+                module.relative_attention_num_buckets = new_num_buckets
+                module.relative_attention_max_distance = new_num_position_embeddings
+
+            elif isinstance(module, T5Attention):
+                module.relative_attention_num_buckets = new_num_buckets
+                module.relative_attention_max_distance = new_num_position_embeddings
+
+        self.config.relative_attention_num_buckets = new_num_buckets
+        self.config.relative_attention_max_distance = new_num_position_embeddings
+
+        logger.info(
+            f"Resized T5 position embeddings: max_distance {old_max_distance} → "
+            f"{new_num_position_embeddings}, num_buckets {old_num_buckets} → {new_num_buckets}."
+        )
 
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from life2lang.models import T5Config, T5Model, T5ForConditionalGeneration, T5Tokenizer
+from life2lang.models.t5.modeling_t5 import T5Attention
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,104 @@ class TestT5ForConditionalGeneration:
 
         for attr in ("d_model", "d_ff", "num_layers", "num_heads", "vocab_size"):
             assert getattr(loaded.config, attr) == getattr(small_config, attr)
+
+
+# ---------------------------------------------------------------------------
+# resize_position_embeddings tests
+# ---------------------------------------------------------------------------
+
+class TestResizePositionEmbeddings:
+    OLD_MAX = 128
+    NEW_MAX = 512
+
+    @pytest.fixture
+    def model(self):
+        cfg = T5Config(
+            vocab_size=32128,
+            d_model=64,
+            d_kv=8,
+            d_ff=128,
+            num_layers=2,
+            num_decoder_layers=2,
+            num_heads=4,
+            dropout_rate=0.0,
+            decoder_start_token_id=0,
+            relative_attention_max_distance=self.OLD_MAX,
+            relative_attention_num_buckets=32,
+        )
+        return T5ForConditionalGeneration(cfg)
+
+    def test_get_position_embeddings_returns_current(self, model):
+        assert model.get_position_embeddings() == self.OLD_MAX
+
+    def test_resize_updates_config(self, model):
+        model.resize_position_embeddings(self.NEW_MAX)
+        assert model.config.relative_attention_max_distance == self.NEW_MAX
+
+    def test_resize_updates_all_attention_modules(self, model):
+        model.resize_position_embeddings(self.NEW_MAX)
+        for module in model.modules():
+            if isinstance(module, T5Attention):
+                assert module.relative_attention_max_distance == self.NEW_MAX
+
+    def test_num_buckets_scales_proportionally(self, model):
+        old_buckets = model.config.relative_attention_num_buckets
+        model.resize_position_embeddings(self.NEW_MAX)
+        new_buckets = model.config.relative_attention_num_buckets
+        expected = round(old_buckets * self.NEW_MAX / self.OLD_MAX)
+        # Allow ±1 for even-rounding
+        assert abs(new_buckets - expected) <= 1
+        assert new_buckets % 2 == 0
+
+    def test_bias_embedding_grows(self, model):
+        old_buckets = model.config.relative_attention_num_buckets
+        model.resize_position_embeddings(self.NEW_MAX)
+        new_buckets = model.config.relative_attention_num_buckets
+        assert new_buckets > old_buckets
+        for module in model.modules():
+            if isinstance(module, T5Attention) and module.has_relative_attention_bias:
+                assert module.relative_attention_bias.num_embeddings == new_buckets
+
+    def test_old_bias_weights_preserved(self, model):
+        for module in model.modules():
+            if isinstance(module, T5Attention) and module.has_relative_attention_bias:
+                old_weight = module.relative_attention_bias.weight.detach().clone()
+                old_rows = old_weight.shape[0]
+                break
+
+        model.resize_position_embeddings(self.NEW_MAX)
+
+        for module in model.modules():
+            if isinstance(module, T5Attention) and module.has_relative_attention_bias:
+                new_weight = module.relative_attention_bias.weight
+                assert torch.allclose(new_weight[:old_rows], old_weight)
+                break
+
+    def test_forward_pass_after_resize(self, model):
+        model.resize_position_embeddings(self.NEW_MAX)
+        input_ids = torch.randint(0, model.config.vocab_size, (1, 64))
+        with torch.no_grad():
+            out = model(input_ids=input_ids, labels=input_ids)
+        assert out.loss.item() > 0
+
+    def test_generate_longer_sequence_after_resize(self, model):
+        model.resize_position_embeddings(self.NEW_MAX)
+        input_ids = torch.randint(0, model.config.vocab_size, (1, 8))
+        with torch.no_grad():
+            out = model.generate(input_ids, max_new_tokens=32)
+        assert out.shape[1] > 1
+
+    def test_reject_smaller_value(self, model):
+        with pytest.raises(ValueError):
+            model.resize_position_embeddings(self.OLD_MAX - 1)
+
+    def test_reject_equal_value(self, model):
+        with pytest.raises(ValueError):
+            model.resize_position_embeddings(self.OLD_MAX)
+
+    def test_get_position_embeddings_reflects_resize(self, model):
+        model.resize_position_embeddings(self.NEW_MAX)
+        assert model.get_position_embeddings() == self.NEW_MAX
 
 
 # ---------------------------------------------------------------------------
