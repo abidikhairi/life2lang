@@ -4,8 +4,14 @@
 from collections.abc import Mapping
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.onnx.config import OnnxSeq2SeqConfigWithPast
 from transformers.utils import logging
+
+try:
+    from transformers.onnx.config import OnnxSeq2SeqConfigWithPast
+    _onnx_available = True
+except ImportError:
+    _onnx_available = False
+    OnnxSeq2SeqConfigWithPast = object
 
 
 logger = logging.get_logger(__name__)
@@ -87,6 +93,7 @@ class T5Config(PretrainedConfig):
         pad_token_id=0,
         eos_token_id=1,
         classifier_dropout=0.0,
+        tie_word_embeddings=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -126,6 +133,7 @@ class T5Config(PretrainedConfig):
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             is_encoder_decoder=is_encoder_decoder,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
 

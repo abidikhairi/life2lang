@@ -26,7 +26,21 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.pytorch_utils import prune_linear_layer
+
+try:
+    from transformers.pytorch_utils import find_pruneable_heads_and_indices
+except ImportError:
+    # Removed in transformers 5.x — provide a local implementation.
+    def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+        mask = torch.ones(n_heads, head_size)
+        heads = set(heads) - already_pruned_heads
+        for head in heads:
+            head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+            mask[head] = 0
+        mask = mask.view(-1).contiguous().eq(1)
+        index = torch.arange(len(mask))[mask].long()
+        return heads, index
 from transformers.utils import (
     DUMMY_INPUTS,
     DUMMY_MASK,
@@ -38,7 +52,17 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+from transformers import initialization as init
+
+try:
+    from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+except ImportError:
+    # Removed in transformers 5.x — stubs for the deprecated .parallelize() API.
+    def assert_device_map(device_map, num_blocks):
+        pass
+
+    def get_device_map(n_layers, devices):
+        return {i: [i] for i in range(n_layers)}
 
 from life2lang.models.t5.configuration_t5 import T5Config
 
@@ -655,6 +679,25 @@ class T5PreTrainedModel(PreTrainedModel):
     _no_split_modules = ["T5Block"]
     _keep_in_fp32_modules = ["wo"]
 
+    def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+        if head_mask is not None:
+            head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+        else:
+            head_mask = [None] * num_hidden_layers
+        return head_mask
+
+    def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+        if head_mask.dim() == 1:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
+        head_mask = head_mask.to(dtype=self.dtype)
+        return head_mask
+
     @property
     def dummy_inputs(self):
         input_ids = torch.tensor(DUMMY_INPUTS)
@@ -666,62 +709,56 @@ class T5PreTrainedModel(PreTrainedModel):
         }
         return dummy_inputs
 
+    @torch.no_grad()
     def _init_weights(self, module):
         """Initialize the weights"""
         factor = self.config.initializer_factor  # Used for testing weights initialization
         if isinstance(module, T5LayerNorm):
-            module.weight.data.fill_(factor * 1.0)
+            init.constant_(module.weight, factor * 1.0)
         elif isinstance(
             module,
             (T5Model, T5ForConditionalGeneration, T5EncoderModel),
         ):
-            # Mesh TensorFlow embeddings initialization
-            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L1624
-            module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
+            init.normal_(module.shared.weight, mean=0.0, std=factor * 1.0)
             if hasattr(module, "lm_head") and not self.config.tie_word_embeddings:
-                module.lm_head.weight.data.normal_(mean=0.0, std=factor * 1.0)
+                init.normal_(module.lm_head.weight, mean=0.0, std=factor * 1.0)
             if hasattr(module, "qa_outputs"):
-                module.qa_outputs.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
-                module.qa_outputs.bias.data.zero_()
+                init.normal_(module.qa_outputs.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+                init.zeros_(module.qa_outputs.bias)
         elif isinstance(module, T5ClassificationHead):
-            module.dense.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+            init.normal_(module.dense.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.dense, "bias") and module.dense.bias is not None:
-                module.dense.bias.data.zero_()
-            module.out_proj.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+                init.zeros_(module.dense.bias)
+            init.normal_(module.out_proj.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.out_proj, "bias") and module.out_proj.bias is not None:
-                module.out_proj.bias.data.zero_()
+                init.zeros_(module.out_proj.bias)
         elif isinstance(module, T5DenseActDense):
-            # Mesh TensorFlow FF initialization
-            # See https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/transformer/transformer_layers.py#L56
-            # and https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L89
-            module.wi.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+            init.normal_(module.wi.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.wi, "bias") and module.wi.bias is not None:
-                module.wi.bias.data.zero_()
-            module.wo.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
+                init.zeros_(module.wi.bias)
+            init.normal_(module.wo.weight, mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
             if hasattr(module.wo, "bias") and module.wo.bias is not None:
-                module.wo.bias.data.zero_()
+                init.zeros_(module.wo.bias)
         elif isinstance(module, T5DenseGatedActDense):
-            module.wi_0.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+            init.normal_(module.wi_0.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.wi_0, "bias") and module.wi_0.bias is not None:
-                module.wi_0.bias.data.zero_()
-            module.wi_1.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
+                init.zeros_(module.wi_0.bias)
+            init.normal_(module.wi_1.weight, mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.wi_1, "bias") and module.wi_1.bias is not None:
-                module.wi_1.bias.data.zero_()
-            module.wo.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
+                init.zeros_(module.wi_1.bias)
+            init.normal_(module.wo.weight, mean=0.0, std=factor * ((self.config.d_ff) ** -0.5))
             if hasattr(module.wo, "bias") and module.wo.bias is not None:
-                module.wo.bias.data.zero_()
+                init.zeros_(module.wo.bias)
         elif isinstance(module, T5Attention):
-            # Mesh TensorFlow attention initialization to avoid scaling before softmax
-            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/attention.py#L136
             d_model = self.config.d_model
             key_value_proj_dim = self.config.d_kv
             n_heads = self.config.num_heads
-            module.q.weight.data.normal_(mean=0.0, std=factor * ((d_model * key_value_proj_dim) ** -0.5))
-            module.k.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
-            module.v.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
-            module.o.weight.data.normal_(mean=0.0, std=factor * ((n_heads * key_value_proj_dim) ** -0.5))
+            init.normal_(module.q.weight, mean=0.0, std=factor * ((d_model * key_value_proj_dim) ** -0.5))
+            init.normal_(module.k.weight, mean=0.0, std=factor * (d_model**-0.5))
+            init.normal_(module.v.weight, mean=0.0, std=factor * (d_model**-0.5))
+            init.normal_(module.o.weight, mean=0.0, std=factor * ((n_heads * key_value_proj_dim) ** -0.5))
             if module.has_relative_attention_bias:
-                module.relative_attention_bias.weight.data.normal_(mean=0.0, std=factor * ((d_model) ** -0.5))
+                init.normal_(module.relative_attention_bias.weight, mean=0.0, std=factor * ((d_model) ** -0.5))
 
     def _shift_right(self, input_ids):
         decoder_start_token_id = self.config.decoder_start_token_id
@@ -1169,7 +1206,10 @@ class T5Model(T5PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [
         "decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
     ]
-    _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+    _tied_weights_keys = {
+        "encoder.embed_tokens.weight": "shared.weight",
+        "decoder.embed_tokens.weight": "shared.weight",
+    }
 
     def __init__(self, config: T5Config):
         super().__init__(config)
@@ -1413,7 +1453,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
     _keys_to_ignore_on_load_unexpected = [
         "decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
     ]
-    _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
+    _tied_weights_keys = {
+        "encoder.embed_tokens.weight": "shared.weight",
+        "decoder.embed_tokens.weight": "shared.weight",
+        "lm_head.weight": "shared.weight",
+    }
 
     def __init__(self, config: T5Config):
         super().__init__(config)
@@ -1691,7 +1735,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
 
 @auto_docstring
 class T5EncoderModel(T5PreTrainedModel):
-    _tied_weights_keys = ["encoder.embed_tokens.weight"]
+    _tied_weights_keys = {"encoder.embed_tokens.weight": "shared.weight"}
     _keys_to_ignore_on_load_unexpected = [r"decoder"]
 
     def __init__(self, config: T5Config):
