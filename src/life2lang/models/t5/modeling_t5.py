@@ -1486,6 +1486,10 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
         self.model_parallel = False
         self.device_map = None
 
+    def resize_position_embeddings(self, new_num_position_embeddings: int):
+        pass
+
+
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
         warnings.warn(
